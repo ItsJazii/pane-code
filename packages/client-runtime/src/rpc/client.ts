@@ -174,6 +174,14 @@ interface SubscriptionOptions<TTag extends EnvironmentSubscriptionRpcTag> {
   ) => Effect.Effect<void, never, never>;
   readonly retryExpectedFailureAfter?: Duration.Input;
   readonly resubscribe?: Stream.Stream<unknown, never, never>;
+  /**
+   * Marks an expected failure as terminal for the current session: the
+   * failure is still reported through onExpectedFailure, but the subscription
+   * is not retried after it. The next session change still resubscribes once,
+   * so reconnect behavior is preserved. Use for failures that cannot resolve
+   * themselves by retrying, e.g. subscribing to a deleted thread.
+   */
+  readonly isTerminalExpectedFailure?: (error: EnvironmentRpcStreamFailure<TTag>) => boolean;
 }
 
 export function subscribeDynamic<TTag extends EnvironmentSubscriptionRpcTag>(
@@ -247,17 +255,28 @@ export function subscribeDynamic<TTag extends EnvironmentSubscriptionRpcTag>(
                             ).pipe(Stream.drain);
                           }
                           if (hasOnlyExpectedFailures && options?.onExpectedFailure !== undefined) {
-                            const handled = Stream.fromEffect(
-                              options.onExpectedFailure(cause),
-                            ).pipe(Stream.drain);
-                            if (options.retryExpectedFailureAfter === undefined) {
+                            const {
+                              onExpectedFailure,
+                              retryExpectedFailureAfter,
+                              isTerminalExpectedFailure,
+                            } = options;
+                            const handled = Stream.fromEffect(onExpectedFailure(cause)).pipe(
+                              Stream.drain,
+                            );
+                            const isTerminalFailure =
+                              isTerminalExpectedFailure !== undefined &&
+                              cause.reasons.every(
+                                (reason) =>
+                                  reason._tag === "Fail" && isTerminalExpectedFailure(reason.error),
+                              );
+                            if (isTerminalFailure || retryExpectedFailureAfter === undefined) {
                               return handled;
                             }
                             return handled.pipe(
                               Stream.concat(
-                                Stream.fromEffect(
-                                  Effect.sleep(options.retryExpectedFailureAfter),
-                                ).pipe(Stream.drain),
+                                Stream.fromEffect(Effect.sleep(retryExpectedFailureAfter)).pipe(
+                                  Stream.drain,
+                                ),
                               ),
                               Stream.concat(subscribeToSession()),
                             );

@@ -58,12 +58,14 @@ import {
   applyKimiAcpModeSelection,
   applyKimiAcpModelSelection,
   applyKimiAcpThinkingSelection,
+  classifyKimiPermissionRequest,
   currentKimiModeIdFromConfigOptions,
   currentKimiModeIdFromSessionSetup,
   currentKimiModelIdFromConfigOptions,
   currentKimiModelIdFromSessionSetup,
   findKimiThinkingConfigOption,
   kimiConfigOptionsFromSessionNotification,
+  kimiPermissionRequestDetail,
   kimiSessionHasModelConfigOption,
   resolveKimiAcpModeId,
   shouldKimiAdapterAutoApprove,
@@ -160,14 +162,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 const resolveNotificationTurnId = (ctx: KimiSessionContext): TurnId | undefined => ctx.activeTurnId;
 
 const resolveCallbackTurnId = (ctx: KimiSessionContext): TurnId | undefined => ctx.activeTurnId;
-
-const resolveSessionCallbackTurnId = (
-  sessions: ReadonlyMap<ThreadId, KimiSessionContext>,
-  threadId: ThreadId,
-): TurnId | undefined => {
-  const ctx = sessions.get(threadId);
-  return ctx ? resolveCallbackTurnId(ctx) : undefined;
-};
 
 function parseKimiResume(raw: unknown): { sessionId: string } | undefined {
   if (!isRecord(raw)) return undefined;
@@ -622,10 +616,32 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             yield* acp.handleRequestPermission((params) =>
               Effect.gen(function* () {
                 yield* logNative(input.threadId, "session/request_permission", params);
+                const sessionCtx = sessions.get(input.threadId);
+                const callbackTurnId =
+                  sessionCtx !== undefined ? resolveCallbackTurnId(sessionCtx) : undefined;
+                // A permission request that arrives after the turn was stopped
+                // (Kimi has not processed session/cancel yet) must never open
+                // a fresh approval card on the dead turn; cancel it outright.
+                if (
+                  sessionCtx === undefined ||
+                  sessionCtx.stopped ||
+                  callbackTurnId === undefined ||
+                  sessionCtx.promptsInFlight <= 0 ||
+                  sessionCtx.interruptedTurnIds.has(callbackTurnId)
+                ) {
+                  return { outcome: { outcome: "cancelled" as const } };
+                }
+                const requestKind = classifyKimiPermissionRequest(params);
+                // Plan decisions (ExitPlanMode) are user decisions, so they
+                // fall through to the regular approval card below: answering
+                // cancelled reads as "dialog dismissed" to kimi-cli and makes
+                // it retry ExitPlanMode in a loop, while answering
+                // plan_approve lets the CLI leave plan mode and implement in
+                // the same turn. T3's proposed-plan flow is not used for Kimi.
                 if (
                   shouldKimiAdapterAutoApprove({
                     runtimeMode: input.runtimeMode,
-                    currentModeId: sessions.get(input.threadId)?.currentModeId,
+                    requestKind,
                   })
                 ) {
                   const autoApprovedOptionId = selectAutoApprovedPermissionOption(params);
@@ -642,7 +658,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                 const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                 const runtimeRequestId = RuntimeRequestId.make(requestId);
                 const decision = yield* Deferred.make<ProviderApprovalDecision>();
-                const turnId = resolveSessionCallbackTurnId(sessions, input.threadId);
+                const turnId = callbackTurnId;
                 pendingApprovals.set(requestId, { decision });
                 yield* offerRuntimeEvent(
                   makeAcpRequestOpenedEvent({
@@ -653,6 +669,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     requestId: runtimeRequestId,
                     permissionRequest,
                     detail:
+                      kimiPermissionRequestDetail(params) ??
                       permissionRequest.detail ??
                       encodeJsonStringForDiagnostics(params)?.slice(0, 2000) ??
                       "[unserializable params]",
