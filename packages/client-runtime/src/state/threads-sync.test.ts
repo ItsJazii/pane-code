@@ -2,6 +2,7 @@ import {
   EnvironmentId,
   EventId,
   ORCHESTRATION_WS_METHODS,
+  OrchestrationGetSnapshotError,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -562,6 +563,85 @@ describe("EnvironmentThreads", () => {
       expect(Option.isNone(recovered.error)).toBe(true);
       expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
       expect(yield* Ref.get(harness.retryCount)).toBe(0);
+    }),
+  );
+
+  it.effect("stops retrying when the server reports the thread was deleted", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_THREAD });
+      yield* Queue.offer(
+        harness.inputs,
+        new OrchestrationGetSnapshotError({
+          message: `Thread ${THREAD_ID} was not found`,
+        }),
+      );
+
+      const failed = yield* awaitThreadState(harness.observed, (value) =>
+        Option.isSome(value.error),
+      );
+      expect(Option.getOrThrow(failed.error)).toContain("was not found");
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+
+      // A deleted thread never comes back within the session, so the usual
+      // retry window must not resubscribe.
+      yield* TestClock.adjust("60 seconds");
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+
+      // A replacement session still gets one fresh attempt, so a thread that
+      // reappears (or a misclassified failure) recovers on reconnect.
+      yield* harness.replaceSession;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) >= 2) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+      yield* Queue.offer(
+        harness.inputs,
+        snapshot({
+          ...BASE_THREAD,
+          title: "Restored thread",
+        }),
+      );
+      const restored = yield* awaitThreadState(
+        harness.observed,
+        (value) =>
+          value.status === "live" &&
+          Option.isSome(value.data) &&
+          value.data.value.title === "Restored thread",
+      );
+      expect(Option.isNone(restored.error)).toBe(true);
+    }),
+  );
+
+  it.effect("keeps retrying transient snapshot failures within the session", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ cached: BASE_THREAD });
+      yield* Queue.offer(
+        harness.inputs,
+        new OrchestrationGetSnapshotError({
+          message: `Failed to load thread ${THREAD_ID}`,
+        }),
+      );
+
+      yield* awaitThreadState(harness.observed, (value) => Option.isSome(value.error));
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(1);
+
+      // Transient load failures stay retryable: the retry window resubscribes.
+      yield* TestClock.adjust("250 millis");
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) >= 2) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+      expect(yield* Ref.get(harness.subscriptionCount)).toBe(2);
+      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD));
+      yield* awaitThreadState(harness.observed, (value) => value.status === "live");
     }),
   );
 
