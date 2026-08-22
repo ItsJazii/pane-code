@@ -640,6 +640,13 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         onExpectedFailure: setStreamError,
         retryExpectedFailureAfter: "250 millis",
         resubscribe: foregroundResubscriptions,
+        // A deleted thread's snapshot never materializes, so retrying it just
+        // storms the server with not-found lookups. The message match is
+        // against this machine's own threadId, so transient snapshot load
+        // failures stay retryable.
+        isTerminalExpectedFailure: (error) =>
+          error._tag === "OrchestrationGetSnapshotError" &&
+          error.message === `Thread ${threadId} was not found`,
       },
     ).pipe(Stream.runForEach(applyItem)),
   );
