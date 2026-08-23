@@ -44,6 +44,7 @@ import {
   ProjectSearchContentsError,
   ProjectSearchEntriesError,
   ProjectWriteFileError,
+  ProviderUploadFeedbackError,
   RelayClientInstallFailedError,
   type RelayClientInstallProgressEvent,
   type ServerSelfUpdateError,
@@ -52,8 +53,7 @@ import {
   FilesystemBrowseError,
   AssetWorkspaceContextNotFoundError,
   AssetWorkspaceContextResolutionError,
-  defaultInstanceIdForDriver,
-  ProviderDriverKind,
+  KimiAuthRequestError,
   RpcClientId,
   EnvironmentAuthorizationError,
   ThreadId,
@@ -90,6 +90,7 @@ import {
   observeRpcStreamEffect as instrumentRpcStreamEffect,
 } from "./observability/RpcInstrumentation.ts";
 import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
+import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as KimiOAuth from "./provider/kimi/KimiOAuth.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
@@ -442,6 +443,7 @@ const makeWsRpcLayer = (
       const previewManager = yield* PreviewManager.PreviewManager;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
+      const providerService = yield* ProviderService.ProviderService;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
       const config = yield* ServerConfig.ServerConfig;
@@ -1549,6 +1551,20 @@ const makeWsRpcLayer = (
             ).pipe(Effect.map((providers) => ({ providers }))),
             { "rpc.aggregate": "server" },
           ),
+        [WS_METHODS.providerUploadFeedback]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.providerUploadFeedback,
+            providerService.uploadFeedback(input).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderUploadFeedbackError({
+                    threadId: input.threadId,
+                    cause,
+                  }),
+              ),
+            ),
+            { "rpc.aggregate": "provider" },
+          ),
         [WS_METHODS.serverUpdateProvider]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverUpdateProvider,
@@ -1743,24 +1759,51 @@ const makeWsRpcLayer = (
             WS_METHODS.kimiAuthSignIn,
             Effect.gen(function* () {
               const settings = yield* serverSettings.getSettings.pipe(
-                Effect.orElseSucceed(() => undefined),
+                Effect.mapError(
+                  (cause) =>
+                    new KimiAuthRequestError({
+                      operation: "provider-settings",
+                      cause,
+                    }),
+                ),
               );
-              const homePath = KimiOAuth.resolveKimiSignInHomePath(settings, input.instanceId);
-              const refreshInstanceId =
-                input.instanceId ?? defaultInstanceIdForDriver(ProviderDriverKind.make("kimi"));
-              return KimiOAuth.signInWithKimi({ homePath }).pipe(
+              const target = yield* KimiOAuth.resolveKimiAuthTarget(settings, input.instanceId);
+              return KimiOAuth.signInWithKimi({ homePath: target.homePath }).pipe(
                 // A fresh credential flips the probe to authenticated; refresh
                 // eagerly so the UI reflects the sign-in without waiting for
                 // the periodic health check.
                 Stream.tap((event) =>
                   event.type === "completed"
-                    ? providerRegistry.refreshInstance(refreshInstanceId).pipe(Effect.ignore)
+                    ? providerRegistry.refreshInstance(target.instanceId).pipe(Effect.ignore)
                     : Effect.void,
                 ),
                 Stream.provideService(HttpClient.HttpClient, kimiSignInHttpClient),
                 Stream.provideService(FileSystem.FileSystem, kimiSignInFileSystem),
                 Stream.provideService(Path.Path, kimiSignInPath),
               );
+            }),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.kimiAuthSignOut]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.kimiAuthSignOut,
+            Effect.gen(function* () {
+              const settings = yield* serverSettings.getSettings.pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new KimiAuthRequestError({
+                      operation: "provider-settings",
+                      cause,
+                    }),
+                ),
+              );
+              const target = yield* KimiOAuth.resolveKimiAuthTarget(settings, input.instanceId);
+              yield* KimiOAuth.removeKimiCredentials(target.homePath).pipe(
+                Effect.provideService(FileSystem.FileSystem, kimiSignInFileSystem),
+                Effect.provideService(Path.Path, kimiSignInPath),
+              );
+              yield* providerRegistry.refreshInstance(target.instanceId).pipe(Effect.ignore);
+              return { type: "completed" } as const;
             }),
             { "rpc.aggregate": "server" },
           ),

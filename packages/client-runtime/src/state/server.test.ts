@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  ProviderInstanceId,
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
@@ -31,6 +32,7 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
   applyServerConfigProjection,
+  kimiAuthTargetKey,
   makeEnvironmentServerConfigState,
   isLegacyUpdateHandoffLoss,
   matchesServerUpdateReadyEvent,
@@ -75,6 +77,21 @@ function session(client: WsRpcProtocolClient): RpcSession {
     closed: Effect.never,
   };
 }
+
+describe("Kimi authentication targets", () => {
+  it("keys sign-in state and single-flight lanes by environment and instance", () => {
+    const environment = EnvironmentId.make("environment-1");
+    const otherEnvironment = EnvironmentId.make("environment-2");
+    const personal = ProviderInstanceId.make("kimi_personal");
+    const work = ProviderInstanceId.make("kimi_work");
+
+    expect(kimiAuthTargetKey(environment, personal)).toBe(kimiAuthTargetKey(environment, personal));
+    expect(kimiAuthTargetKey(environment, personal)).not.toBe(kimiAuthTargetKey(environment, work));
+    expect(kimiAuthTargetKey(environment, personal)).not.toBe(
+      kimiAuthTargetKey(otherEnvironment, personal),
+    );
+  });
+});
 
 describe("update restart reconnect nudges", () => {
   it.effect("retries once per backoff entry instead of only the first", () =>
@@ -123,6 +140,30 @@ describe("update restart reconnect nudges", () => {
 
       yield* Fiber.join(fiber);
     }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("retries rejected credentials only while the update restart is in progress", () =>
+    Effect.gen(function* () {
+      const retries = yield* Ref.make(0);
+
+      yield* nudgeReconnectDuringUpdateRestart({
+        stateChanges: Stream.fromIterable([
+          { phase: "blocked", lastFailure: { reason: "permission" } },
+          {
+            phase: "blocked",
+            lastFailure: {
+              reason: "authentication",
+              detail: "The environment credential is invalid.",
+            },
+          },
+          { phase: "blocked", lastFailure: { reason: "configuration" } },
+        ]),
+        retryNow: Ref.update(retries, (count) => count + 1),
+        interval: Duration.zero,
+      });
+
+      expect(yield* Ref.get(retries)).toBe(1);
+    }),
   );
 });
 

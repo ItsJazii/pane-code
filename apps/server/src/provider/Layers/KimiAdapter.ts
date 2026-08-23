@@ -109,6 +109,7 @@ interface KimiSessionContext {
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
   readonly terminals: KimiAcpTerminalManager;
+  readonly promptSemaphore: Semaphore.Semaphore;
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly configOptionsRef: Ref.Ref<ReadonlyArray<EffectAcpSchema.SessionConfigOption>>;
@@ -197,6 +198,10 @@ function completedStopReasonFromPromptResponse(
   response: EffectAcpSchema.PromptResponse | undefined,
 ): EffectAcpSchema.StopReason | null {
   return response?.stopReason ?? null;
+}
+
+export function clearSettledKimiInterruptedTurnIds(interruptedTurnIds: Set<TurnId>): void {
+  interruptedTurnIds.clear();
 }
 
 export function kimiPromptSettlementBelongsToContext(input: {
@@ -418,6 +423,9 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             },
           });
         }
+        if (!options?.settleAllPrompts && (shouldEmitFailedTurn || shouldEmitCompletedTurn)) {
+          clearSettledKimiInterruptedTurnIds(liveCtx.interruptedTurnIds);
+        }
       });
 
     const logNative = (threadId: ThreadId, method: string, payload: unknown) =>
@@ -597,7 +605,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                 new ProviderAdapterProcessError({
                   provider: PROVIDER,
                   threadId: input.threadId,
-                  detail: cause.message,
+                  detail: "Failed to start the Kimi ACP session.",
                   cause,
                 }),
             ),
@@ -774,6 +782,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             createdAt: now,
             updatedAt: now,
           };
+          const promptSemaphore = yield* Semaphore.make(1);
 
           const ctx: KimiSessionContext = {
             threadId: input.threadId,
@@ -782,6 +791,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
             scope: sessionScope,
             acp,
             terminals,
+            promptSemaphore,
             notificationFiber: undefined,
             pendingApprovals,
             configOptionsRef,
@@ -1044,7 +1054,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                           new ProviderAdapterRequestError({
                             provider: PROVIDER,
                             method: "session/prompt",
-                            detail: cause.message,
+                            detail: "Failed to read a turn attachment.",
                             cause,
                           }),
                       ),
@@ -1114,6 +1124,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                 acpSessionId: ctx.acpSessionId,
                 displayModel,
                 promptParts,
+                promptSemaphore: ctx.promptSemaphore,
                 turnId,
               };
             }).pipe(
@@ -1140,7 +1151,33 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
 
         const promptFailureMessageRef = yield* Ref.make<string | undefined>(undefined);
 
-        return yield* Effect.gen(function* () {
+        const runPrompt = Effect.gen(function* () {
+          const promptAdmitted = yield* withThreadLock(
+            input.threadId,
+            Effect.gen(function* () {
+              const ctx = yield* requireSession(input.threadId);
+              if (
+                ctx.acpSessionId !== prepared.acpSessionId ||
+                ctx.interruptedTurnIds.has(prepared.turnId) ||
+                ctx.promptsInFlight <= 0 ||
+                ctx.activeTurnId !== prepared.turnId ||
+                ctx.session.activeTurnId !== prepared.turnId
+              ) {
+                return false;
+              }
+              clearSettledKimiInterruptedTurnIds(ctx.interruptedTurnIds);
+              return true;
+            }),
+          );
+          if (!promptAdmitted) {
+            yield* Ref.set(promptSettled, true);
+            return {
+              threadId: input.threadId,
+              turnId: prepared.turnId,
+              resumeCursor: (yield* requireSession(input.threadId)).session.resumeCursor,
+            };
+          }
+
           const result = yield* prepared.acp
             .prompt({
               prompt: prepared.promptParts,
@@ -1261,7 +1298,7 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                     stopReason: completedStopReason,
                   },
                 });
-                ctx.interruptedTurnIds.delete(prepared.turnId);
+                clearSettledKimiInterruptedTurnIds(ctx.interruptedTurnIds);
                 yield* Ref.set(promptSettled, true);
               } else if (remainingPrompts > 0) {
                 yield* Ref.set(promptSettled, true);
@@ -1336,6 +1373,36 @@ export function makeKimiAdapter(kimiSettings: KimiSettings, options?: KimiAdapte
                 input.threadId,
                 settlePromptInFlight(input.threadId, prepared.turnId, prepared.acpSessionId, {
                   errorMessage: errorMessage ?? "Kimi prompt request failed.",
+                }),
+              );
+            }).pipe(
+              // Every path through this finalizer accounts for the prompt
+              // slot, so the queued-interrupt compensation below must no-op.
+              Effect.ensuring(Ref.set(promptSettled, true)),
+              Effect.catch(() => Effect.void),
+            ),
+          ),
+        );
+        // The finalizer above only runs once runPrompt has started, which
+        // requires holding the permit. A fiber interrupted while still QUEUED
+        // on the semaphore (a steer waiting behind an active prompt when the
+        // client drops the request) would skip cleanup entirely, leaving
+        // promptsInFlight raised and the turn-activity tracker marked active,
+        // which defers provider probes until the session stops.
+        return yield* prepared.promptSemaphore.withPermit(runPrompt).pipe(
+          Effect.onInterrupt(() =>
+            Effect.gen(function* () {
+              if (yield* Ref.get(promptSettled)) {
+                return;
+              }
+              yield* Ref.set(promptSettled, true);
+              // With another prompt still in flight this only releases the
+              // slot; if the dropped steer was the last slot it settles the
+              // merged turn with an honest cancelled completion.
+              yield* withThreadLock(
+                input.threadId,
+                settlePromptInFlight(input.threadId, prepared.turnId, prepared.acpSessionId, {
+                  completedStopReason: "cancelled",
                 }),
               );
             }).pipe(Effect.catch(() => Effect.void)),

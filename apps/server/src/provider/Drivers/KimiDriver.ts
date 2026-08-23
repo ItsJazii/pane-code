@@ -75,14 +75,14 @@ export function runKimiProbeWithActiveTurnDeferral<A, E, R>(input: {
   readonly probe: Effect.Effect<A, E, R>;
 }): Effect.Effect<A, E, R> {
   return Effect.gen(function* () {
-    const activeCount = yield* input.turnActivity.activeCount;
-    if (activeCount > 0) {
+    while (!(yield* input.turnActivity.beginProbeIfIdle)) {
+      const activeCount = yield* input.turnActivity.activeCount;
       yield* Effect.logDebug("Deferring Kimi provider probe until active turns settle.", {
         activeTurnCount: activeCount,
       });
       yield* input.turnActivity.awaitIdle;
     }
-    return yield* input.probe;
+    return yield* input.probe.pipe(Effect.ensuring(input.turnActivity.endProbe));
   });
 }
 
@@ -237,7 +237,7 @@ export const KimiDriver: ProviderDriver<KimiSettings, KimiDriverEnv> = {
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: `Failed to build Kimi snapshot: ${cause.message ?? String(cause)}`,
+              detail: "Failed to build the Kimi provider snapshot.",
               cause,
             }),
         ),

@@ -67,6 +67,12 @@ interface KimiTerminalOutputBuffer {
   readonly byteLimit: number;
 }
 
+interface KimiPendingTerminalCreation {
+  readonly scope: Scope.Closeable;
+  killRequested: boolean;
+  disposeRequested: boolean;
+}
+
 interface KimiTerminalState {
   readonly scope: Scope.Closeable;
   readonly buffer: KimiTerminalOutputBuffer;
@@ -139,6 +145,7 @@ export const makeKimiAcpTerminalManager = (input: {
 }): Effect.Effect<KimiAcpTerminalManager> =>
   Effect.sync(() => {
     const terminals = new Map<string, KimiTerminalState>();
+    const pendingCreations = new Map<string, KimiPendingTerminalCreation>();
     let nextTerminalId = 0;
 
     const requireTerminal = (
@@ -164,79 +171,110 @@ export const makeKimiAcpTerminalManager = (input: {
       });
 
     const handleCreateTerminal: KimiAcpTerminalManager["handleCreateTerminal"] = (request) =>
-      Effect.gen(function* () {
-        const terminalId = `term-${++nextTerminalId}`;
-        const scope = yield* Scope.make();
-        const env = request.env
-          ? Object.fromEntries(request.env.map((entry) => [entry.name, entry.value]))
-          : undefined;
-        // Kimi sends an absolute command path (its Git Bash wrapper on
-        // Windows), so no shell resolution is involved.
-        const handle = yield* input.childProcessSpawner
-          .spawn(
-            ChildProcess.make(request.command, request.args ?? [], {
-              ...(request.cwd ? { cwd: request.cwd } : {}),
-              ...(env ? { env, extendEnv: true } : {}),
-              stdin: "ignore",
-              // Kill escalation for release/shutdown of commands that ignore
-              // the default termination signal.
-              forceKillAfter: "5 seconds",
-            }),
-          )
-          .pipe(
-            Effect.provideService(Scope.Scope, scope),
-            Effect.onError(() => Effect.ignore(Scope.close(scope, Exit.void))),
-            Effect.mapError((cause) =>
-              EffectAcpErrors.AcpRequestError.internalError(
-                `Failed to spawn terminal command '${request.command}'.`,
-                undefined,
-                { method: "terminal/create", cause },
-              ),
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const terminalId = `term-${++nextTerminalId}`;
+          const scope = yield* Scope.make();
+          const pendingCreation: KimiPendingTerminalCreation = {
+            scope,
+            killRequested: false,
+            disposeRequested: false,
+          };
+          pendingCreations.set(terminalId, pendingCreation);
+          const env = request.env
+            ? Object.fromEntries(request.env.map((entry) => [entry.name, entry.value]))
+            : undefined;
+          // Kimi sends an absolute command path (its Git Bash wrapper on
+          // Windows), so no shell resolution is involved.
+          const handleExit = yield* Effect.exit(
+            restore(
+              input.childProcessSpawner
+                .spawn(
+                  ChildProcess.make(request.command, request.args ?? [], {
+                    ...(request.cwd ? { cwd: request.cwd } : {}),
+                    ...(env ? { env, extendEnv: true } : {}),
+                    stdin: "ignore",
+                    // Kill escalation for release/shutdown of commands that ignore
+                    // the default termination signal.
+                    forceKillAfter: "5 seconds",
+                  }),
+                )
+                .pipe(
+                  Effect.provideService(Scope.Scope, scope),
+                  Effect.mapError((cause) =>
+                    EffectAcpErrors.AcpRequestError.internalError(
+                      `Failed to spawn terminal command '${request.command}'.`,
+                      undefined,
+                      { method: "terminal/create", cause },
+                    ),
+                  ),
+                ),
             ),
           );
+          if (Exit.isFailure(handleExit)) {
+            pendingCreations.delete(terminalId);
+            yield* Effect.ignore(Scope.close(scope, Exit.void));
+            return yield* Effect.failCause(handleExit.cause);
+          }
+          const handle = handleExit.value;
 
-        const buffer: KimiTerminalOutputBuffer = {
-          output: "",
-          outputBytes: 0,
-          truncated: false,
-          byteLimit: Math.max(0, request.outputByteLimit ?? DEFAULT_OUTPUT_BYTE_LIMIT),
-        };
-        const exit = yield* Deferred.make<KimiTerminalExit>();
+          const buffer: KimiTerminalOutputBuffer = {
+            output: "",
+            outputBytes: 0,
+            truncated: false,
+            byteLimit: Math.max(0, request.outputByteLimit ?? DEFAULT_OUTPUT_BYTE_LIMIT),
+          };
+          const exit = yield* Deferred.make<KimiTerminalExit>();
 
-        // One streaming decoder per stream so interleaving cannot split a
-        // multi-byte character across decode calls.
-        const drainStream = (stream: typeof handle.stdout): Effect.Effect<void> =>
-          Effect.suspend(() => {
-            const decoder = new TextDecoder("utf-8");
-            return Stream.runForEach(stream, (chunk) =>
-              Effect.sync(() =>
-                appendTerminalOutput(buffer, decoder.decode(chunk, { stream: true })),
-              ),
-            ).pipe(
-              Effect.ensuring(Effect.sync(() => appendTerminalOutput(buffer, decoder.decode()))),
-              Effect.ignore,
+          // One streaming decoder per stream so interleaving cannot split a
+          // multi-byte character across decode calls.
+          const drainStream = (stream: typeof handle.stdout): Effect.Effect<void> =>
+            Effect.suspend(() => {
+              const decoder = new TextDecoder("utf-8");
+              return Stream.runForEach(stream, (chunk) =>
+                Effect.sync(() =>
+                  appendTerminalOutput(buffer, decoder.decode(chunk, { stream: true })),
+                ),
+              ).pipe(
+                Effect.ensuring(Effect.sync(() => appendTerminalOutput(buffer, decoder.decode()))),
+                Effect.ignore,
+              );
+            });
+
+          const stdoutFiber = yield* drainStream(handle.stdout).pipe(Effect.forkIn(scope));
+          const stderrFiber = yield* drainStream(handle.stderr).pipe(Effect.forkIn(scope));
+          yield* handle.exitCode.pipe(
+            Effect.matchEffect({
+              onSuccess: (exitCode) => Deferred.succeed(exit, { exitCode, signal: null }),
+              onFailure: (error) => Deferred.succeed(exit, exitFromSignalFailure(error)),
+            }),
+            Effect.forkIn(scope),
+          );
+
+          const terminalState: KimiTerminalState = {
+            scope,
+            buffer,
+            exit,
+            drainFibers: [stdoutFiber, stderrFiber],
+            kill: Effect.ignore(handle.kill()),
+          };
+          terminals.set(terminalId, terminalState);
+          pendingCreations.delete(terminalId);
+          if (pendingCreation.disposeRequested) {
+            yield* disposeTerminal(terminalId, terminalState);
+            return yield* EffectAcpErrors.AcpRequestError.internalError(
+              "Terminal creation was cancelled because the Kimi session stopped.",
+              undefined,
+              { method: "terminal/create" },
             );
-          });
-
-        const stdoutFiber = yield* drainStream(handle.stdout).pipe(Effect.forkIn(scope));
-        const stderrFiber = yield* drainStream(handle.stderr).pipe(Effect.forkIn(scope));
-        yield* handle.exitCode.pipe(
-          Effect.matchEffect({
-            onSuccess: (exitCode) => Deferred.succeed(exit, { exitCode, signal: null }),
-            onFailure: (error) => Deferred.succeed(exit, exitFromSignalFailure(error)),
-          }),
-          Effect.forkIn(scope),
-        );
-
-        terminals.set(terminalId, {
-          scope,
-          buffer,
-          exit,
-          drainFibers: [stdoutFiber, stderrFiber],
-          kill: Effect.ignore(handle.kill()),
-        });
-        return { terminalId } satisfies EffectAcpSchema.CreateTerminalResponse;
-      });
+          }
+          if (pendingCreation.killRequested) {
+            yield* Deferred.succeed(exit, { exitCode: null, signal: "SIGTERM" });
+            yield* terminalState.kill;
+          }
+          return { terminalId } satisfies EffectAcpSchema.CreateTerminalResponse;
+        }),
+      );
 
     const handleTerminalOutput: KimiAcpTerminalManager["handleTerminalOutput"] = (request) =>
       Effect.gen(function* () {
@@ -292,26 +330,42 @@ export const makeKimiAcpTerminalManager = (input: {
       });
 
     const killAll: Effect.Effect<void> = Effect.suspend(() =>
-      Effect.forEach(
-        Array.from(terminals.values()),
-        (state) =>
-          // Settle the exit first so a concurrent wait_for_exit observes the
-          // SIGTERM status deterministically; Deferred.succeed is a no-op when
-          // the process already exited. The kill then stops the process (a
-          // no-op for an already-dead one) while the entry stays readable.
-          Effect.gen(function* () {
-            yield* Deferred.succeed(state.exit, { exitCode: null, signal: "SIGTERM" });
-            yield* state.kill;
-          }),
-        { discard: true },
+      Effect.sync(() => {
+        for (const pending of pendingCreations.values()) {
+          pending.killRequested = true;
+        }
+        return Array.from(terminals.values());
+      }).pipe(
+        Effect.flatMap((snapshot) =>
+          Effect.forEach(
+            snapshot,
+            (state) =>
+              // Settle the exit first so a concurrent wait_for_exit observes the
+              // SIGTERM status deterministically; Deferred.succeed is a no-op when
+              // the process already exited. The kill then stops the process (a
+              // no-op for an already-dead one) while the entry stays readable.
+              Effect.gen(function* () {
+                yield* Deferred.succeed(state.exit, { exitCode: null, signal: "SIGTERM" });
+                yield* state.kill;
+              }),
+            { discard: true },
+          ),
+        ),
       ),
     );
 
     const shutdown: Effect.Effect<void> = Effect.suspend(() =>
-      Effect.forEach(
-        Array.from(terminals.entries()),
-        ([terminalId, state]) => disposeTerminal(terminalId, state),
-        { discard: true },
+      Effect.sync(() => {
+        for (const pending of pendingCreations.values()) {
+          pending.disposeRequested = true;
+        }
+        return Array.from(terminals.entries());
+      }).pipe(
+        Effect.flatMap((snapshot) =>
+          Effect.forEach(snapshot, ([terminalId, state]) => disposeTerminal(terminalId, state), {
+            discard: true,
+          }),
+        ),
       ),
     );
 

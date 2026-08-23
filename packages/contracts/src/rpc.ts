@@ -52,7 +52,13 @@ import {
   ReviewDiffPreviewResult,
 } from "./review.ts";
 import { KeybindingsConfigError } from "./keybindings.ts";
-import { KimiAuthError, KimiAuthSignInEvent, KimiAuthSignInInput } from "./kimiAuth.ts";
+import {
+  KimiAuthCompletedEvent,
+  KimiAuthError,
+  KimiAuthSignInEvent,
+  KimiAuthSignInInput,
+  KimiAuthSignOutInput,
+} from "./kimiAuth.ts";
 import {
   ClientOrchestrationCommand,
   ORCHESTRATION_WS_METHODS,
@@ -67,6 +73,11 @@ import {
   OrchestrationRpcSchemas,
   OrchestrationGetWorkflowScriptError,
 } from "./orchestration.ts";
+import {
+  ProviderUploadFeedbackError,
+  ProviderUploadFeedbackInput,
+  ProviderUploadFeedbackResult,
+} from "./provider.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   PullRequestActionInput,
@@ -212,6 +223,9 @@ export const WS_METHODS = {
   filesystemBrowse: "filesystem.browse",
   assetsCreateUrl: "assets.createUrl",
 
+  // Provider methods
+  providerUploadFeedback: "provider.uploadFeedback",
+
   // VCS methods
   vcsPull: "vcs.pull",
   vcsRefreshStatus: "vcs.refreshStatus",
@@ -279,8 +293,9 @@ export const WS_METHODS = {
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
   cloudInstallRelayClient: "cloud.installRelayClient",
 
-  // Kimi in-app sign-in (OAuth device flow)
+  // Kimi in-app authentication
   kimiAuthSignIn: "kimiAuth.signIn",
+  kimiAuthSignOut: "kimiAuth.signOut",
 
   // Pull request methods
   pullRequestsList: "pullRequests.list",
@@ -487,6 +502,12 @@ export const WsKimiAuthSignInRpc = Rpc.make(WS_METHODS.kimiAuthSignIn, {
   stream: true,
 });
 
+export const WsKimiAuthSignOutRpc = Rpc.make(WS_METHODS.kimiAuthSignOut, {
+  payload: KimiAuthSignOutInput,
+  success: KimiAuthCompletedEvent,
+  error: Schema.Union([KimiAuthError, EnvironmentAuthorizationError]),
+});
+
 const PullRequestRpcError = Schema.Union([
   PullRequestUnavailableError,
   PullRequestOperationError,
@@ -680,6 +701,12 @@ export const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   payload: AssetCreateUrlInput,
   success: AssetCreateUrlResult,
   error: Schema.Union([AssetAccessError, EnvironmentAuthorizationError]),
+});
+
+export const WsProviderUploadFeedbackRpc = Rpc.make(WS_METHODS.providerUploadFeedback, {
+  payload: ProviderUploadFeedbackInput,
+  success: ProviderUploadFeedbackResult,
+  error: Schema.Union([ProviderUploadFeedbackError, EnvironmentAuthorizationError]),
 });
 
 export const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
@@ -1024,6 +1051,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,
   WsKimiAuthSignInRpc,
+  WsKimiAuthSignOutRpc,
   WsPullRequestsListRpc,
   WsPullRequestsListStatsRpc,
   WsPullRequestsDetailRpc,
@@ -1052,6 +1080,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
+  WsProviderUploadFeedbackRpc,
   WsSubscribeVcsStatusRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,

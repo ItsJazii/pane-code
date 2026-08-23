@@ -1,5 +1,8 @@
 import {
+  defaultInstanceIdForDriver,
   type EnvironmentId,
+  ProviderDriverKind,
+  type ProviderInstanceId,
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
@@ -92,13 +95,27 @@ export interface KimiSignInTarget {
   readonly input: EnvironmentRpcInput<typeof WS_METHODS.kimiAuthSignIn>;
 }
 
+export interface KimiSignOutTarget {
+  readonly environmentId: EnvironmentId;
+  readonly input: EnvironmentRpcInput<typeof WS_METHODS.kimiAuthSignOut>;
+}
+
+const DEFAULT_KIMI_INSTANCE_ID = defaultInstanceIdForDriver(ProviderDriverKind.make("kimi"));
+
+export function kimiAuthTargetKey(
+  environmentId: EnvironmentId,
+  instanceId: ProviderInstanceId,
+): string {
+  return `${environmentId}\0${instanceId}`;
+}
+
 const IDLE_KIMI_SIGN_IN_STATE: KimiSignInState = { status: "idle" };
 const EMPTY_KIMI_SIGN_IN_STATE_ATOM = Atom.make<KimiSignInState>(IDLE_KIMI_SIGN_IN_STATE).pipe(
   Atom.withLabel("environment-data:server:kimi-sign-in-state:empty"),
 );
-const kimiSignInStateAtomFamily = Atom.family((environmentId: EnvironmentId) =>
+const kimiSignInStateAtomFamily = Atom.family((targetKey: string) =>
   Atom.make<KimiSignInState>(IDLE_KIMI_SIGN_IN_STATE).pipe(
-    Atom.withLabel(`environment-data:server:kimi-sign-in-state:${environmentId}`),
+    Atom.withLabel(`environment-data:server:kimi-sign-in-state:${targetKey}`),
   ),
 );
 
@@ -191,16 +208,30 @@ export function validateServerUpdateReadyEvent(
  * each nudge is the pacer: a connection that fails instantly re-enters backoff
  * immediately and would otherwise spin a tight retry loop.
  *
+ * A newly restarted server can also reject the first environment credential.
+ * Authentication blocks need the same paced retry during this known restart;
+ * permission and configuration failures remain blocked.
+ *
  * Callers fork this as a child of the update command so it is interrupted as
  * soon as the update settles, whether it succeeds, fails, or times out.
  */
 export function nudgeReconnectDuringUpdateRestart(input: {
-  readonly stateChanges: Stream.Stream<{ readonly phase: string }, unknown>;
+  readonly stateChanges: Stream.Stream<
+    {
+      readonly phase: string;
+      readonly lastFailure?: { readonly reason: string } | null;
+    },
+    unknown
+  >;
   readonly retryNow: Effect.Effect<void>;
   readonly interval?: Duration.Duration;
 }): Effect.Effect<void> {
   return input.stateChanges.pipe(
-    Stream.filter((state) => state.phase === "backoff"),
+    Stream.filter(
+      (state) =>
+        state.phase === "backoff" ||
+        (state.phase === "blocked" && state.lastFailure?.reason === "authentication"),
+    ),
     Stream.runForEach(() =>
       Effect.sleep(input.interval ?? Duration.seconds(1)).pipe(Effect.andThen(input.retryNow)),
     ),
@@ -700,10 +731,13 @@ export function createServerEnvironmentAtoms<R, E>(
       );
     },
   });
-  const kimiSignInStateAtom = (environmentId: EnvironmentId | null) =>
+  const kimiSignInStateAtom = (
+    environmentId: EnvironmentId | null,
+    instanceId: ProviderInstanceId,
+  ) =>
     environmentId === null
       ? EMPTY_KIMI_SIGN_IN_STATE_ATOM
-      : kimiSignInStateAtomFamily(environmentId);
+      : kimiSignInStateAtomFamily(kimiAuthTargetKey(environmentId, instanceId));
   const kimiSignIn = createRuntimeCommand<
     EnvironmentRegistry | EnvironmentCacheStore | R,
     E,
@@ -714,10 +748,16 @@ export function createServerEnvironmentAtoms<R, E>(
     label: "environment-data:server:kimi-sign-in",
     concurrency: {
       mode: "singleFlight",
-      key: ({ environmentId }) => environmentId,
+      key: ({ environmentId, input }) =>
+        kimiAuthTargetKey(environmentId, input.instanceId ?? DEFAULT_KIMI_INSTANCE_ID),
     },
     execute: (target, atomRegistry) => {
-      const stateAtom = kimiSignInStateAtomFamily(target.environmentId);
+      const stateAtom = kimiSignInStateAtomFamily(
+        kimiAuthTargetKey(
+          target.environmentId,
+          target.input.instanceId ?? DEFAULT_KIMI_INSTANCE_ID,
+        ),
+      );
       atomRegistry.set(stateAtom, { status: "starting" });
       return Effect.gen(function* () {
         const environmentRegistry = yield* EnvironmentRegistry;
@@ -758,6 +798,38 @@ export function createServerEnvironmentAtoms<R, E>(
     },
   });
 
+  const kimiSignOut = createRuntimeCommand<
+    EnvironmentRegistry | EnvironmentCacheStore | R,
+    E,
+    KimiSignOutTarget,
+    void,
+    unknown
+  >(runtime, {
+    label: "environment-data:server:kimi-sign-out",
+    concurrency: {
+      mode: "singleFlight",
+      key: ({ environmentId, input }) =>
+        kimiAuthTargetKey(environmentId, input.instanceId ?? DEFAULT_KIMI_INSTANCE_ID),
+    },
+    execute: (target, atomRegistry) =>
+      Effect.gen(function* () {
+        const environmentRegistry = yield* EnvironmentRegistry;
+        yield* environmentRegistry.run(
+          target.environmentId,
+          request(WS_METHODS.kimiAuthSignOut, target.input),
+        );
+        atomRegistry.set(
+          kimiSignInStateAtomFamily(
+            kimiAuthTargetKey(
+              target.environmentId,
+              target.input.instanceId ?? DEFAULT_KIMI_INSTANCE_ID,
+            ),
+          ),
+          IDLE_KIMI_SIGN_IN_STATE,
+        );
+      }),
+  });
+
   const settingsValueAtom = Atom.family((environmentId: EnvironmentId) =>
     Atom.make((get) => get(configValueAtom(environmentId))?.settings ?? null).pipe(
       Atom.withLabel(`environment-data:server:settings:${environmentId}`),
@@ -776,6 +848,7 @@ export function createServerEnvironmentAtoms<R, E>(
     providersValueAtom,
     kimiSignIn,
     kimiSignInStateAtom,
+    kimiSignOut,
     traceDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:trace-diagnostics",
       tag: WS_METHODS.serverGetTraceDiagnostics,
